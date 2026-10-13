@@ -171,7 +171,8 @@ const DATA=[["Wake up + breakfast + get ready","Saturday","7:15 AM","8:15 AM","M
 const DAYS=["Saturday","Sunday","Monday","Tuesday","Wednesday","Thursday","Friday"];
 const mins=s=>{const m=s.match(/(\d+):(\d+) (AM|PM)/);let h=+m[1]%12;if(m[3]=="PM")h+=12;return h*60+ +m[2]};
 const fmt=m=>{m=(m%1440+1440)%1440;let h=Math.floor(m/60),mm=m%60,a=h>=12?"PM":"AM";h=h%12||12;return h+":"+String(mm).padStart(2,"0")+" "+a};
-const baseItems=DATA.map((r,i)=>({id:"base-"+i,n:r[0],d:r[1],s:mins(r[2]),e:mins(r[3]),t:r[4],p:r[5],x:r[6],priority:"medium",custom:false}));
+let baseItems=DATA.map((r,i)=>({id:"base-"+i,n:r[0],d:r[1],s:mins(r[2]),e:mins(r[3]),t:r[4],p:r[5],x:r[6],priority:"medium",custom:false}));
+let emptyDefaultPlan=false;
 const builtInCategories={College:"#3b5bdb",Work:"#d9480f",Study:"#7048e8",Gym:"#2b8a3e",Prayer:"#0b7285",Meal:"#c77700",Break:"#868e96",Commute:"#868e96",Sleep:"#495057"};
 let STORAGE_KEY="my-week-planner-state-v1";
 const readJSON=(key,fallback)=>{try{const value=localStorage.getItem(key);return value===null?fallback:JSON.parse(value)}catch(e){return fallback}};
@@ -266,7 +267,7 @@ const SUPABASE_URL = "https://opygdvgljgwphywrljms.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_EFnis1LPanxzCvMWuV1NnA_bCDxrf_o";
 const authStatusEl=document.getElementById("authStatus");
 function authMessage(message,failed=false){authStatusEl.textContent=message;authStatusEl.style.color=failed?"#c0392b":"var(--mute)";}
-function currentPlannerState(){return {version:3,done:store,customTasks:customItems,deletedTasks:deletedItems,categories,taskOverrides};}
+function currentPlannerState(){return {version:4,emptyDefaultPlan,done:store,customTasks:customItems,deletedTasks:deletedItems,categories,taskOverrides};}
 function applyPlannerState(state){
   if(!state||typeof state!=="object")return;
   store=state.done&&typeof state.done==="object"?state.done:{};
@@ -274,9 +275,48 @@ function applyPlannerState(state){
   deletedItems=Array.isArray(state.deletedTasks)?state.deletedTasks:[];
   categories=state.categories&&typeof state.categories==="object"?state.categories:{};
   taskOverrides=state.taskOverrides&&typeof state.taskOverrides==="object"?state.taskOverrides:{};
+  emptyDefaultPlan=state.emptyDefaultPlan===true;
+  if(emptyDefaultPlan){baseItems.splice(0,baseItems.length);}
   items.splice(0,items.length,...baseItems.filter(it=>!deletedItems.includes(it.id)).map(it=>({...it,...(taskOverrides[it.id]||{})})),...customItems);
   localStorage.setItem(STORAGE_KEY,JSON.stringify(currentPlannerState()));
   fillTaskOptions();refreshFilters();renderCategories();render();nowCard();updateDashboard();
+}
+async function loadPrayerTasks(){
+  // Prayer times are generated from the user's current browser location, not stored as fixed defaults.
+  const addPrayerRows=(timings,dateObj)=>{
+    const dayName=DAYS[(dateObj.getDay()+1)%7];
+    const prayerNames=[["Fajr","Fajr"],["Dhuhr","Dhuhr"],["Asr","Asr"],["Maghrib","Maghrib"],["Isha","Isha"]];
+    for(const [name,field] of prayerNames){
+      const raw=timings[field]; if(!raw) continue;
+      const match=String(raw).match(/(\\d{1,2}):(\\d{2})/); if(!match) continue;
+      const start=Number(match[1])*60+Number(match[2]);
+      baseItems.push({id:"prayer-"+dateObj.toISOString().slice(0,10)+"-"+name.toLowerCase(),n:name+" prayer",d:dayName,s:start,e:(start+15)%1440,t:"Prayer",p:"Based on your location",x:"Calculated automatically from your location. Check local mosque announcements for adjustments.",priority:"medium",custom:false});
+    }
+  };
+  let coords=null;
+  try{
+    if(navigator.geolocation){
+      coords=await new Promise(resolve=>navigator.geolocation.getCurrentPosition(
+        pos=>resolve({lat:pos.coords.latitude,lon:pos.coords.longitude}),
+        ()=>resolve(null),{enableHighAccuracy:false,timeout:7000,maximumAge:3600000}));
+    }
+  }catch(e){coords=null;}
+  if(!coords){authMessage("Planner is ready, but location access is needed to calculate prayer times. Allow location and reload.",true);return;}
+  const today=new Date();
+  const saturday=new Date(today.getFullYear(),today.getMonth(),today.getDate()-((today.getDay()+1)%7));
+  try{
+    const requests=[];
+    for(let i=0;i<7;i++){
+      const dateObj=new Date(saturday.getFullYear(),saturday.getMonth(),saturday.getDate()+i);
+      const dateStr=String(dateObj.getDate()).padStart(2,"0")+"-"+String(dateObj.getMonth()+1).padStart(2,"0")+"-"+dateObj.getFullYear();
+      requests.push(fetch("https://api.aladhan.com/v1/timings/"+dateStr+"?latitude="+encodeURIComponent(coords.lat)+"&longitude="+encodeURIComponent(coords.lon)+"&method=5")
+        .then(r=>{if(!r.ok)throw Error("Prayer time service unavailable");return r.json();})
+        .then(j=>{if(j&&j.data&&j.data.timings)addPrayerRows(j.data.timings,dateObj);}));
+    }
+    await Promise.all(requests);
+    items.splice(0,items.length,...baseItems,...customItems);
+    fillTaskOptions();refreshFilters();render();nowCard();updateDashboard();
+  }catch(e){authMessage("Could not retrieve prayer times. Check your connection and reload.",true);}
 }
 async function queueCloudSave(state){
   if(!cloudClient||!cloudUser||!cloudReady)return;
@@ -302,8 +342,22 @@ async function syncSignedInUser(user){
   const {data,error}=await cloudClient.from("planner_states").select("state").eq("user_id",user.id).maybeSingle();
   if(error){authMessage("Could not load cloud data. Run the SQL setup and check RLS policies.",true);persistenceStatus("Cloud connection needs setup.",true);return;}
   if(data&&data.state){applyPlannerState(data.state);}
+  if(!data){
+    // Never copy browser-local/default tasks into a newly created account.
+    emptyDefaultPlan=true;
+    baseItems.splice(0,baseItems.length);
+    store={};customItems=[];deletedItems=[];categories={};taskOverrides={};
+    items.splice(0,items.length);
+    await loadPrayerTasks();
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(currentPlannerState()));
+  } else if(data.state.emptyDefaultPlan===true) {
+    emptyDefaultPlan=true;
+    baseItems.splice(0,baseItems.length);
+    await loadPrayerTasks();
+    items.splice(0,items.length,...baseItems,...customItems);
+  }
   cloudReady=true;
-  if(!data){await queueCloudSave(currentPlannerState());authMessage("Account connected. Your current planner has been saved to this account.");}
+  if(!data){await queueCloudSave(currentPlannerState());authMessage("Account created with an empty planner and location-based prayer times.");}
   else{authMessage("Cloud sync is active for this account.");persistenceStatus("Synced to your account.");}
 }
 async function initializeSupabase(){
